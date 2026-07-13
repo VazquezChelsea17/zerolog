@@ -8,30 +8,41 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/rs/diode"
+	"code.cloudfoundry.org/go-diodes"
 )
 
 // Writer is a io.Writer wrapper that uses a diode to buffer writes.
 type Writer struct {
-	w      io.Writer
-	d      diode.Diode
-	c      context.CancelFunc
-	wg     *sync.WaitGroup
-	mux    *sync.RWMutex
-	closed *uint32
+	w          io.Writer
+	d          *diodes.ManyToOne
+	c          context.CancelFunc
+	wg         *sync.WaitGroup
+	mux        *sync.RWMutex
+	closed     *uint32
+	closeState *writerCloseState
+}
+
+type writerCloseState struct {
+	once sync.Once
+	err  error
 }
 
 // NewWriter creates a new Writer.
 func NewWriter(w io.Writer, size int, pollInterval time.Duration, cb func(missed int)) Writer {
 	ctx, cancel := context.WithCancel(context.Background())
 	dw := Writer{
-		w:      w,
-		c:      cancel,
-		wg:     &sync.WaitGroup{},
-		mux:    &sync.RWMutex{},
-		closed: new(uint32),
+		w:          w,
+		c:          cancel,
+		wg:         &sync.WaitGroup{},
+		mux:        &sync.RWMutex{},
+		closed:     new(uint32),
+		closeState: &writerCloseState{},
 	}
-	dw.d = diode.New(size, diode.Alerter(cb))
+	var alerter diodes.Alerter
+	if cb != nil {
+		alerter = diodes.AlertFunc(cb)
+	}
+	dw.d = diodes.NewManyToOne(size, alerter)
 	dw.wg.Add(1)
 	go dw.poll(ctx, pollInterval)
 	return dw
@@ -47,22 +58,30 @@ func (dw Writer) Write(p []byte) (n int, err error) {
 	// Copy p because diode is async and p can be reused by the caller.
 	c := make([]byte, len(p))
 	copy(c, p)
-	dw.d.Set(unsafe.Pointer(&c))
+	dw.d.Set(diodes.GenericDataType(unsafe.Pointer(&c)))
 	return len(p), nil
 }
 
-// Close closes the writer.
+// Close closes the writer. It blocks until every write accepted before Close
+// started has been flushed to the underlying writer. Writes attempted after
+// shutdown starts return io.ErrClosedPipe.
 func (dw Writer) Close() error {
-	dw.mux.Lock()
-	atomic.StoreUint32(dw.closed, 1)
-	dw.mux.Unlock()
+	dw.closeState.once.Do(func() {
+		// Taking the exclusive lock waits for in-flight writes and prevents new
+		// writes from being accepted while the consumer drains the queue.
+		dw.mux.Lock()
+		atomic.StoreUint32(dw.closed, 1)
+		dw.mux.Unlock()
 
-	dw.c()
-	dw.wg.Wait()
-	if c, ok := dw.w.(io.Closer); ok {
-		return c.Close()
-	}
-	return nil
+		dw.c()
+		// poll drains the queue after cancellation and calls Done only after the
+		// final underlying write has completed.
+		dw.wg.Wait()
+		if c, ok := dw.w.(io.Closer); ok {
+			dw.closeState.err = c.Close()
+		}
+	})
+	return dw.closeState.err
 }
 
 func (dw Writer) poll(ctx context.Context, interval time.Duration) {
@@ -76,6 +95,7 @@ func (dw Writer) poll(ctx context.Context, interval time.Duration) {
 		if ticker != nil {
 			select {
 			case <-ctx.Done():
+				// Process messages accepted before Close before exiting.
 				dw.drain()
 				return
 			case <-ticker.C:
@@ -83,25 +103,27 @@ func (dw Writer) poll(ctx context.Context, interval time.Duration) {
 		} else {
 			select {
 			case <-ctx.Done():
+				// Process messages accepted before Close before exiting.
 				dw.drain()
 				return
 			default:
 			}
 		}
-		if p := dw.d.Next(); p != nil {
-			dw.w.Write(*(*[]byte)(p))
+		if p, ok := dw.d.TryNext(); ok {
+			dw.w.Write(*(*[]byte)(unsafe.Pointer(p)))
 		} else if ticker == nil {
 			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
 
+// drain synchronously writes every item remaining in the diode queue.
 func (dw Writer) drain() {
 	for {
-		p := dw.d.Next()
-		if p == nil {
+		p, ok := dw.d.TryNext()
+		if !ok {
 			break
 		}
-		dw.w.Write(*(*[]byte)(p))
+		dw.w.Write(*(*[]byte)(unsafe.Pointer(p)))
 	}
 }
